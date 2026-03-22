@@ -1,6 +1,25 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+/**
+ * HTTP transport for web/cloud deployment.
+ *
+ * Exposes:
+ *   GET  /health                                  – liveness probe
+ *   GET  /.well-known/oauth-authorization-server  – OAuth metadata (RFC 8414)
+ *   POST /oauth/register                          – dynamic client registration
+ *   GET  /oauth/authorize                         – start OAuth flow → Azure AD
+ *   GET  /oauth/callback                          – Azure AD callback
+ *   POST /oauth/token                             – exchange code → session token
+ *   *    /mcp                                     – MCP Streamable-HTTP endpoint
+ *
+ * Authentication on /mcp:
+ *   Every request must carry  Authorization: Bearer <session-token>
+ *   where the session token was issued by POST /oauth/token.
+ *   The token maps to the user's per-session ADO access token obtained via
+ *   their individual Azure AD login.
+ */
+
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 
@@ -13,26 +32,30 @@ import { configureAllTools } from "./tools.js";
 import { DomainsManager } from "./shared/domains.js";
 import { UserAgentComposer } from "./useragent.js";
 import { packageVersion } from "./version.js";
+import * as oauthStore from "./oauth/store.js";
+import { handleMetadata, handleRegister, handleAuthorize, handleCallback, handleToken, OAuthConfig } from "./oauth/server.js";
 
 export interface HttpServerConfig {
-  /** Default Azure DevOps organization name (overridable per-request via X-ADO-Org header) */
+  /** Default ADO organisation (overridable per-session via X-ADO-Org header at /oauth/authorize time). */
   organization: string;
-  /** Port to listen on */
   port: number;
-  /** Fallback token provider when no per-request token is supplied */
-  fallbackTokenProvider: () => Promise<string>;
-  /** Domains to enable (default: all) */
+  /** Domains to enable (default: all). */
   domains: string | string[];
-  /** Allowed CORS origins, "*" for any (default) */
+  /** Comma-separated allowed CORS origins, or "*". */
   corsOrigins: string;
+  oauth: OAuthConfig;
 }
 
-interface SessionData {
+// ---------------------------------------------------------------------------
+// Per-session MCP state
+// ---------------------------------------------------------------------------
+
+interface McpSession {
   transport: StreamableHTTPServerTransport;
 }
 
-/** In-memory session store: sessionId → transport */
-const sessions = new Map<string, SessionData>();
+/** MCP sessions keyed by the `Mcp-Session-Id` header value. */
+const mcpSessions = new Map<string, McpSession>();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -47,47 +70,30 @@ function applyCorsHeaders(req: IncomingMessage, res: ServerResponse, allowedOrig
     res.setHeader("Vary", "Origin");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-ADO-Token, X-ADO-Org, Mcp-Session-Id");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
   res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
 }
 
-function getTokenFromRequest(req: IncomingMessage): string | undefined {
-  const authHeader = req.headers.authorization;
-  if (authHeader?.startsWith("Bearer ")) return authHeader.substring(7);
-  return (req.headers["x-ado-token"] as string | undefined) || undefined;
-}
-
-function getOrgFromRequest(req: IncomingMessage, defaultOrg: string): string {
-  return (req.headers["x-ado-org"] as string | undefined) || defaultOrg;
+function extractBearerToken(req: IncomingMessage): string | undefined {
+  const auth = req.headers.authorization;
+  return auth?.startsWith("Bearer ") ? auth.substring(7) : undefined;
 }
 
 // ---------------------------------------------------------------------------
-// Session creation
+// MCP session creation (one per OAuth session × connect)
 // ---------------------------------------------------------------------------
 
-/**
- * Creates a new per-session McpServer + StreamableHTTPServerTransport pair.
- * Auth credentials are captured at session-creation time from the incoming
- * request (Authorization / X-ADO-Token header) or fall back to the server-wide
- * token provider.
- */
-async function createSession(req: IncomingMessage, config: HttpServerConfig): Promise<StreamableHTTPServerTransport> {
-  const requestToken = getTokenFromRequest(req);
-  const tokenProvider: () => Promise<string> = requestToken ? async () => requestToken : config.fallbackTokenProvider;
-
-  const orgName = getOrgFromRequest(req, config.organization);
+async function createMcpSession(adoToken: string, orgName: string, config: HttpServerConfig): Promise<StreamableHTTPServerTransport> {
   const orgUrl = `https://dev.azure.com/${orgName}`;
-
   const userAgentComposer = new UserAgentComposer(packageVersion);
+  const tokenProvider = async (): Promise<string> => adoToken;
 
-  const connectionProvider = async (): Promise<WebApi> => {
-    const token = await tokenProvider();
-    return new WebApi(orgUrl, getBearerHandler(token), undefined, {
+  const connectionProvider = async (): Promise<WebApi> =>
+    new WebApi(orgUrl, getBearerHandler(adoToken), undefined, {
       productName: "AzureDevOps.MCP",
       productVersion: packageVersion,
       userAgent: userAgentComposer.userAgent,
     });
-  };
 
   const server = new McpServer({
     name: "Azure DevOps MCP Server",
@@ -100,22 +106,21 @@ async function createSession(req: IncomingMessage, config: HttpServerConfig): Pr
   };
 
   const domainsManager = new DomainsManager(config.domains);
-  const enabledDomains = domainsManager.getEnabledDomains();
-  configureAllTools(server, tokenProvider, connectionProvider, () => userAgentComposer.userAgent, enabledDomains);
+  configureAllTools(server, tokenProvider, connectionProvider, () => userAgentComposer.userAgent, domainsManager.getEnabledDomains());
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
-    onsessioninitialized: (sessionId) => {
-      sessions.set(sessionId, { transport });
-      logger.info("MCP session initialized", { sessionId, org: orgName });
+    onsessioninitialized: (sid) => {
+      mcpSessions.set(sid, { transport });
+      logger.info("MCP session created", { sessionId: sid, org: orgName });
     },
   });
 
   transport.onclose = () => {
-    const sessionId = transport.sessionId;
-    if (sessionId) {
-      sessions.delete(sessionId);
-      logger.info("MCP session closed", { sessionId });
+    const sid = transport.sessionId;
+    if (sid) {
+      mcpSessions.delete(sid);
+      logger.info("MCP session closed", { sessionId: sid });
     }
   };
 
@@ -124,26 +129,40 @@ async function createSession(req: IncomingMessage, config: HttpServerConfig): Pr
 }
 
 // ---------------------------------------------------------------------------
-// HTTP request handler
+// /mcp handler
 // ---------------------------------------------------------------------------
 
 async function handleMcpRequest(req: IncomingMessage, res: ServerResponse, config: HttpServerConfig): Promise<void> {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  // 1. Validate OAuth Bearer token → get the user's ADO token
+  const bearerToken = extractBearerToken(req);
+  if (!bearerToken) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Authorization header with Bearer token required" }));
+    return;
+  }
 
+  const oauthSession = oauthStore.getSession(bearerToken);
+  if (!oauthSession) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Session token invalid or expired. Please reconnect via OAuth." }));
+    return;
+  }
+
+  // 2. Route to existing MCP session or create a fresh one for this OAuth session
+  const mcpSessionId = req.headers["mcp-session-id"] as string | undefined;
   let transport: StreamableHTTPServerTransport;
 
-  if (sessionId) {
-    // Route to existing session
-    const session = sessions.get(sessionId);
-    if (!session) {
+  if (mcpSessionId) {
+    const existing = mcpSessions.get(mcpSessionId);
+    if (!existing) {
       res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Session not found or expired. Please reinitialize." }));
+      res.end(JSON.stringify({ error: "MCP session not found or expired. Reinitialize." }));
       return;
     }
-    transport = session.transport;
+    transport = existing.transport;
   } else {
-    // No session ID → initialize a new session
-    transport = await createSession(req, config);
+    // First request for this OAuth session – spin up a new MCP server instance
+    transport = await createMcpSession(oauthSession.adoToken, oauthSession.orgName, config);
   }
 
   await transport.handleRequest(req, res);
@@ -157,7 +176,6 @@ export async function startHttpServer(config: HttpServerConfig): Promise<void> {
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     applyCorsHeaders(req, res, config.corsOrigins);
 
-    // Preflight
     if (req.method === "OPTIONS") {
       res.writeHead(204);
       res.end();
@@ -174,19 +192,41 @@ export async function startHttpServer(config: HttpServerConfig): Promise<void> {
           status: "healthy",
           version: packageVersion,
           organization: config.organization,
-          activeSessions: sessions.size,
-          transport: "streamable-http",
+          activeMcpSessions: mcpSessions.size,
+          activeOAuthSessions: oauthStore.getActiveSessionCount(),
         }),
       );
       return;
     }
 
-    // MCP endpoint (all methods: POST for messages, GET for SSE stream, DELETE for session termination)
+    // OAuth Authorization Server endpoints
+    if (url.pathname === "/.well-known/oauth-authorization-server" && req.method === "GET") {
+      handleMetadata(req, res, config.oauth);
+      return;
+    }
+    if (url.pathname === "/oauth/register" && req.method === "POST") {
+      await handleRegister(req, res);
+      return;
+    }
+    if (url.pathname === "/oauth/authorize" && req.method === "GET") {
+      handleAuthorize(req, res, config.oauth);
+      return;
+    }
+    if (url.pathname === "/oauth/callback" && req.method === "GET") {
+      await handleCallback(req, res, config.oauth);
+      return;
+    }
+    if (url.pathname === "/oauth/token" && req.method === "POST") {
+      await handleToken(req, res, config.oauth);
+      return;
+    }
+
+    // MCP endpoint
     if (url.pathname === "/mcp") {
       try {
         await handleMcpRequest(req, res, config);
-      } catch (error) {
-        logger.error("Error handling MCP request", { error });
+      } catch (err) {
+        logger.error("Error handling MCP request", { err });
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));
@@ -195,7 +235,6 @@ export async function startHttpServer(config: HttpServerConfig): Promise<void> {
       return;
     }
 
-    // Unknown path
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not found" }));
   });

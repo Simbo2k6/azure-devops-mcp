@@ -145,26 +145,42 @@ async function runHttp() {
     process.exit(1);
   }
 
-  const tenantId = (await getOrgTenant(orgName)) ?? argv.tenant;
-  const fallbackTokenProvider = createAuthenticator(argv.authentication, tenantId);
+  // OAuth config is mandatory in HTTP mode – read from environment variables
+  const azureTenantId = process.env.AZURE_TENANT_ID;
+  const azureClientId = process.env.AZURE_CLIENT_ID;
+  const azureClientSecret = process.env.AZURE_CLIENT_SECRET;
+  const mcpBaseUrl = (process.env.MCP_BASE_URL ?? "").replace(/\/$/, ""); // strip trailing slash
+
+  if (!azureTenantId || !azureClientId || !azureClientSecret || !mcpBaseUrl) {
+    logger.error("HTTP mode requires the following environment variables: AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, MCP_BASE_URL");
+    process.exit(1);
+  }
+
+  // Honour PORT env var so cloud platforms (Azure Container Apps, etc.) can inject the port
+  const port = argv.port !== 3000 ? (argv.port as number) : parseInt(process.env.PORT ?? "3000", 10);
 
   logger.info("Starting Azure DevOps MCP Server (HTTP)", {
     organization: orgName,
-    authentication: argv.authentication,
-    tenant: argv.tenant,
     domains: argv.domains,
     enabledDomains: Array.from(enabledDomains),
-    port: argv.port,
+    port,
+    baseUrl: mcpBaseUrl,
     corsOrigins: argv["cors-origins"],
     version: packageVersion,
   });
 
   await startHttpServer({
     organization: orgName,
-    port: argv.port as number,
-    fallbackTokenProvider,
+    port,
     domains: argv.domains,
     corsOrigins: argv["cors-origins"] as string,
+    oauth: {
+      baseUrl: mcpBaseUrl,
+      azureTenantId,
+      azureClientId,
+      azureClientSecret,
+      defaultOrg: orgName,
+    },
   });
 }
 
