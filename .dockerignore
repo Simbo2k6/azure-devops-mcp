@@ -1,0 +1,14 @@
+node_modules
+dist
+.git
+.github
+*.md
+docs
+test
+coverage
+.husky
+.eslintrc*
+eslint.config.*
+jest.config.*
+tsconfig.jest.json
+*.log
